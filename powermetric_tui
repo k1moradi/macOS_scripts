@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+"""
+powermetric_tui - ultra-smooth braille TUI for powermetrics SMC sensors (macOS only)
+
+Data source:
+    powermetrics --samplers smc -i<ms> -n1
+
+Shows:
+    - CPU die temperature (C)
+    - GPU die temperature (C)
+    - Fan RPM(s)
+
+Features:
+    - Full-screen stacked dashboard.
+    - Ultra-smooth braille graphs (2 samples/col, 4 vertical sub-rows).
+    - powermetrics runs in a background daemon thread:
+        * UI remains responsive.
+        * 'q' quits immediately (no waiting for -i).
+    - Sampling interval chosen from plot width so visible history
+      is ~ TARGET_HISTORY_SECONDS (~1 hour) when possible.
+    - Fixed ranges for CPU/GPU/FAN, optional auto-scale for temps.
+    - Vertical scale labels (top/mid/bottom) per metric.
+    - Horizontal time axis at bottom (now / -Xm).
+    - FAN0 preinitialized at 1500 rpm until first real sample.
+
+Controls:
+    q : quit
+    p : pause / resume applying new samples (history retained)
+    s : toggle fixed vs auto temp scaling
+
+Run:
+    sudo powermetric_tui
+"""
+
+import curses
+import subprocess
+import re
+import sys
+import os
+import time
+import threading
+import queue
+from typing import Dict, List, Optional, Tuple
+
+# ----- Tuning --------------------------------------------------------
+
+TARGET_HISTORY_SECONDS = 3600  # aim for ~1 hour
+
+# Bounds for actual powermetrics sampling interval (seconds)
+MIN_SAMPLE_INTERVAL_SECONDS = 5.0
+MAX_SAMPLE_INTERVAL_SECONDS = 60.0
+
+# For narrow terminals, assume at least this width when computing interval
+MIN_PLOT_WIDTH_FOR_COMPUTE = 80
+
+# Max history assuming fastest sampling over full target
+MAX_HISTORY_LEN = int(TARGET_HISTORY_SECONDS / MIN_SAMPLE_INTERVAL_SECONDS) + 10
+
+# Fixed ranges tuned for 2019 16" Intel MBP
+CPU_MIN_FIXED = 35.0
+CPU_MAX_FIXED = 100.0
+GPU_MIN_FIXED = 30.0
+GPU_MAX_FIXED = 95.0
+FAN_MIN_FIXED = 1000.0
+FAN_MAX_FIXED = 5500.0
+
+# Safe baseline for fan before first real sample
+FAN_DEFAULT = 1500.0
+
+CPU_DIE_RE = re.compile(r"CPU die temperature:\s*([\d\.]+)\s*C", re.IGNORECASE)
+GPU_DIE_RE = re.compile(r"GPU die temperature:\s*([\d\.]+)\s*C", re.IGNORECASE)
+FAN_RE = re.compile(r"Fan(?:\s*(\d+))?:\s*([\d\.]+)\s*rpm", re.IGNORECASE)
+
+
+# ----- Braille helpers ------------------------------------------------
+
+
+def braille_bit(subcol: int, subrow: int) -> int:
+    """
+    Return the bit mask for a braille dot at (subcol, subrow).
+
+    subcol: 0 = left, 1 = right
+    subrow: 0..3 from top to bottom
+    """
+    if subcol == 0:  # left column
+        if subrow == 0:
+            return 1 << 0  # dot 1
+        elif subrow == 1:
+            return 1 << 1  # dot 2
+        elif subrow == 2:
+            return 1 << 2  # dot 3
+        else:
+            return 1 << 6  # dot 7
+    else:  # right column
+        if subrow == 0:
+            return 1 << 3  # dot 4
+        elif subrow == 1:
+            return 1 << 4  # dot 5
+        elif subrow == 2:
+            return 1 << 5  # dot 6
+        else:
+            return 1 << 7  # dot 8
+
+
+# ----- Metric model ---------------------------------------------------
+
+
+class Metric:
+    __slots__ = ("name", "label", "is_temp", "base_min", "base_max", "history")
+
+    def __init__(self, name: str, label: str, is_temp: bool,
+                 base_min: float, base_max: float) -> None:
+        self.name = name
+        self.label = label
+        self.is_temp = is_temp
+        self.base_min = base_min
+        self.base_max = base_max
+        self.history: List[Optional[float]] = []
+
+    def add(self, value: Optional[float]) -> None:
+        self.history.append(value)
+        if len(self.history) > MAX_HISTORY_LEN:
+            self.history.pop(0)
+
+    def latest(self) -> Optional[float]:
+        for v in reversed(self.history):
+            if v is not None:
+                return v
+        return None
+
+    def minmax(self) -> Tuple[Optional[float], Optional[float]]:
+        vals = [v for v in self.history if v is not None]
+        if not vals:
+            return None, None
+        return min(vals), max(vals)
+
+    def bounds(self, use_fixed: bool) -> Tuple[float, float]:
+        # Fans or fixed mode: static ranges.
+        if use_fixed or not self.is_temp:
+            return self.base_min, self.base_max
+
+        vals = [v for v in self.history if v is not None]
+        if not vals:
+            return self.base_min, self.base_max
+
+        vmin = min(vals)
+        vmax = max(vals)
+
+        # Clamp around fixed band for sanity.
+        lo = self.base_min - 10.0
+        hi = self.base_max + 5.0
+        vmin = max(vmin, lo)
+        vmax = min(vmax, hi)
+
+        if vmax <= vmin:
+            vmax = vmin + 5.0
+
+        # Ensure a minimal span.
+        if vmax - vmin < 5.0:
+            mid = 0.5 * (vmin + vmax)
+            vmin = mid - 5.0
+            vmax = mid + 5.0
+
+        return vmin, vmax
+
+    def _values_for_window(self, max_samples: int) -> List[Optional[float]]:
+        vals = self.history[-max_samples:]
+        if len(vals) < max_samples:
+            vals = [None] * (max_samples - len(vals)) + vals
+        return vals
+
+    def block_braille(
+        self,
+        height: int,
+        width: int,
+        use_fixed: bool
+    ) -> Tuple[List[str], float, float, float]:
+        """
+        High-res braille block:
+          - 2 samples per character column
+          - 4 vertical sub-rows
+        Returns (lines, vmin, vmax, vmid).
+        """
+        if height <= 0 or width <= 0:
+            vmin, vmax = self.bounds(use_fixed)
+            return [], vmin, vmax, 0.5 * (vmin + vmax)
+
+        max_samples = width * 2
+        vals = self._values_for_window(max_samples)
+
+        vmin, vmax = self.bounds(use_fixed)
+        vmid = 0.5 * (vmin + vmax)
+        span = vmax - vmin if vmax > vmin else 1.0
+
+        h = height
+        max_hi_y = h * 4 - 1
+
+        cells: List[List[int]] = [[0 for _ in range(width)] for _ in range(h)]
+        hi_y_list: List[Optional[int]] = [None] * max_samples
+
+        # Map samples to high-res coordinates
+        for i, v in enumerate(vals):
+            if v is None:
+                continue
+
+            # clamp
+            if v < vmin:
+                v = vmin
+            elif v > vmax:
+                v = vmax
+
+            frac = (v - vmin) / span
+            if frac < 0.0:
+                frac = 0.0
+            elif frac > 1.0:
+                frac = 1.0
+
+            hi_y = int((1.0 - frac) * max_hi_y + 0.5)
+            if hi_y < 0:
+                hi_y = 0
+            elif hi_y > max_hi_y:
+                hi_y = max_hi_y
+
+            hi_y_list[i] = hi_y
+
+            col = i // 2
+            if col >= width:
+                continue
+            subcol = i % 2
+
+            row = hi_y // 4
+            if row >= h:
+                continue
+            subrow = hi_y % 4
+
+            cells[row][col] |= braille_bit(subcol, subrow)
+
+        # Fill continuity between consecutive points
+        for i in range(1, max_samples):
+            y1 = hi_y_list[i - 1]
+            y2 = hi_y_list[i]
+            if y1 is None or y2 is None or y1 == y2:
+                continue
+
+            col = i // 2
+            if col >= width:
+                continue
+            subcol = i % 2
+
+            lo = min(y1, y2)
+            hi_v = max(y1, y2)
+            for y in range(lo + 1, hi_v):
+                row = y // 4
+                if row >= h:
+                    continue
+                subrow = y % 4
+                cells[row][col] |= braille_bit(subcol, subrow)
+
+        # Convert to braille chars
+        lines: List[str] = []
+        for r in range(h):
+            row_chars: List[str] = []
+            for c in range(width):
+                code = cells[r][c]
+                row_chars.append(chr(0x2800 + code) if code else " ")
+            lines.append("".join(row_chars))
+
+        return lines, vmin, vmax, vmid
+
+
+# ----- Sampling & powermetrics ---------------------------------------
+
+
+def compute_sample_interval_seconds(plot_width: int) -> float:
+    """
+    Choose sampling interval (seconds) so:
+        (plot_width * 2) * interval ≈ TARGET_HISTORY_SECONDS
+    (2 samples per column).
+    """
+    if plot_width <= 0:
+        return MIN_SAMPLE_INTERVAL_SECONDS
+
+    effective_width = max(plot_width, MIN_PLOT_WIDTH_FOR_COMPUTE)
+    ideal = TARGET_HISTORY_SECONDS / float(effective_width * 2)
+
+    if ideal < MIN_SAMPLE_INTERVAL_SECONDS:
+        ideal = MIN_SAMPLE_INTERVAL_SECONDS
+    if ideal > MAX_SAMPLE_INTERVAL_SECONDS:
+        ideal = MAX_SAMPLE_INTERVAL_SECONDS
+
+    return ideal
+
+
+def run_powermetrics_once(sample_interval_seconds: float) -> str:
+    """
+    One blocking powermetrics sample.
+    powermetrics -i expects milliseconds; convert seconds -> ms.
+    """
+    ms = int(sample_interval_seconds * 1000.0)
+    if ms < 1:
+        ms = 1
+
+    return subprocess.check_output(
+        [
+            "powermetrics",
+            "--samplers", "smc",
+            f"-i{ms}",
+            "-n1",
+        ],
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def parse_sample(output: str) -> Tuple[Optional[float], Optional[float], Dict[str, float]]:
+    """Extract CPU die, GPU die, and fan RPM readings."""
+    cpu_die: Optional[float] = None
+    gpu_die: Optional[float] = None
+    fans: Dict[str, float] = {}
+    auto_idx = 0
+
+    for line in output.splitlines():
+        if cpu_die is None:
+            m = CPU_DIE_RE.search(line)
+            if m:
+                try:
+                    cpu_die = float(m.group(1))
+                except ValueError:
+                    cpu_die = None
+
+        if gpu_die is None:
+            m = GPU_DIE_RE.search(line)
+            if m:
+                try:
+                    gpu_die = float(m.group(1))
+                except ValueError:
+                    gpu_die = None
+
+        m = FAN_RE.search(line)
+        if m:
+            idx_s, rpm_s = m.groups()
+            try:
+                rpm = float(rpm_s)
+            except ValueError:
+                continue
+
+            if not idx_s:
+                key = f"fan{auto_idx}"
+                auto_idx += 1
+            else:
+                key = f"fan{int(idx_s)}"
+
+            fans[key] = rpm
+
+    return cpu_die, gpu_die, fans
+
+
+# ----- Metric set management -----------------------------------------
+
+
+def init_metrics() -> Dict[str, Metric]:
+    metrics: Dict[str, Metric] = {
+        "cpu_die": Metric("cpu_die", "CPU", True, CPU_MIN_FIXED, CPU_MAX_FIXED),
+        "gpu_die": Metric("gpu_die", "GPU", True, GPU_MIN_FIXED, GPU_MAX_FIXED),
+        "fan0": Metric("fan0", "FAN0", False, FAN_MIN_FIXED, FAN_MAX_FIXED),
+    }
+    metrics["fan0"].add(FAN_DEFAULT)
+    return metrics
+
+
+def update_metrics(
+    metrics: Dict[str, Metric],
+    cpu_die: Optional[float],
+    gpu_die: Optional[float],
+    fans: Dict[str, float],
+) -> None:
+    if "cpu_die" in metrics:
+        metrics["cpu_die"].add(cpu_die)
+    if "gpu_die" in metrics:
+        metrics["gpu_die"].add(gpu_die)
+
+    for name, rpm in fans.items():
+        if name not in metrics:
+            metrics[name] = Metric(name, name.upper(), False,
+                                   FAN_MIN_FIXED, FAN_MAX_FIXED)
+        metrics[name].add(rpm)
+
+    active = {"cpu_die", "gpu_die"} | set(fans.keys())
+
+    for name, m in metrics.items():
+        if name in active:
+            continue
+
+        if name.startswith("fan"):
+            has_non_default = any(
+                (v is not None and v != FAN_DEFAULT) for v in m.history
+            )
+            if not has_non_default:
+                m.add(FAN_DEFAULT)
+            else:
+                m.add(None)
+        else:
+            m.add(None)
+
+
+# ----- Drawing --------------------------------------------------------
+
+
+def draw(
+    stdscr,
+    metrics: Dict[str, Metric],
+    use_fixed_scale: bool,
+    paused: bool,
+    last_error: Optional[str],
+    effective_interval_s: float,
+) -> int:
+    """
+    Draw one full frame.
+    Returns plot_width actually used.
+    """
+    stdscr.erase()
+    max_y, max_x = stdscr.getmaxyx()
+
+    label_w = 8
+    val_w = 20
+    axis_w = 7
+    plot_w = max(20, max_x - label_w - val_w - axis_w - 5)
+    start_plot_col = label_w + axis_w + 3
+
+    # Visible history estimate based on CPU
+    ref = metrics.get("cpu_die") or (list(metrics.values())[0] if metrics else None)
+    if ref is not None and effective_interval_s > 0:
+        visible_samples = min(len(ref.history), plot_w * 2)
+        visible_seconds = visible_samples * effective_interval_s
+    else:
+        visible_seconds = 0.0
+    visible_minutes = visible_seconds / 60.0
+
+    header = (
+        f" powermetric_tui "
+        f"[q]quit [p]{'resume' if paused else 'pause'} [s]{'fixed' if use_fixed_scale else 'auto'} "
+        f"{effective_interval_s:.1f}s/sample "
+        f"{visible_minutes:4.1f}m/~{TARGET_HISTORY_SECONDS//60}m "
+    )
+    try:
+        stdscr.addnstr(0, 0, header.ljust(max_x), max_x)
+    except curses.error:
+        stdscr.refresh()
+        return plot_w
+
+    row = 1
+    if last_error and row < max_y - 1:
+        msg = f"ERROR: {last_error}"
+        try:
+            stdscr.addnstr(row, 0, msg[:max_x], max_x)
+        except curses.error:
+            pass
+        row += 1
+
+    if max_y - row < 6:
+        if row < max_y:
+            try:
+                stdscr.addnstr(row, 0, "Terminal too small for TUI.".ljust(max_x), max_x)
+            except curses.error:
+                pass
+        stdscr.refresh()
+        return plot_w
+
+    # Metric drawing order
+    keys: List[str] = []
+    if "cpu_die" in metrics:
+        keys.append("cpu_die")
+    if "gpu_die" in metrics:
+        keys.append("gpu_die")
+    keys += sorted(k for k in metrics if k.startswith("fan"))
+
+    if not keys:
+        stdscr.refresh()
+        return plot_w
+
+    n_metrics = len(keys)
+    avail_rows = max_y - row - 1
+    base_h = max(4, avail_rows // n_metrics)
+
+    use_colors = curses.has_colors()
+    if use_colors:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)    # CPU
+        curses.init_pair(2, curses.COLOR_CYAN, -1)   # GPU
+        curses.init_pair(3, curses.COLOR_GREEN, -1)  # Fans
+
+    for idx, key in enumerate(keys):
+        if row >= max_y - 1:
+            break
+
+        remaining = (max_y - 1) - row
+        h = remaining if idx == n_metrics - 1 else min(base_h, remaining)
+        if h < 3:
+            break
+
+        m = metrics[key]
+        latest = m.latest()
+        mn, mx = m.minmax()
+
+        if m.is_temp:
+            if latest is not None:
+                val = f"{latest:5.1f}C"
+            else:
+                val = "  N/A "
+            if mn is not None and mx is not None:
+                val += f" [{mn:4.0f}-{mx:4.0f}]"
+        else:
+            if latest is not None:
+                val = f"{latest:5.0f}rpm"
+            else:
+                val = "  N/A "
+            if mn is not None and mx is not None:
+                val += f" [{mn:4.0f}-{mx:4.0f}]"
+
+        label = f"{m.label:>{label_w}}"
+        summary = f"{label} {val:<{val_w}}"
+
+        try:
+            stdscr.addnstr(row, 0, summary[:max_x], max_x)
+        except curses.error:
+            pass
+
+        plot_height = h - 1
+        block_lines, vmin, vmax, vmid = m.block_braille(plot_height, plot_w, use_fixed_scale)
+
+        # Color
+        color = 0
+        if use_colors:
+            if key == "cpu_die":
+                color = curses.color_pair(1)
+            elif key == "gpu_die":
+                color = curses.color_pair(2)
+            elif key.startswith("fan"):
+                color = curses.color_pair(3)
+
+        # Graph + vertical scale labels
+        for i, bl in enumerate(block_lines):
+            r = row + 1 + i
+            if r >= max_y - 1:
+                break
+
+            if i == 0:
+                lbl = f"{vmax:4.0f}"
+            elif i == plot_height - 1:
+                lbl = f"{vmin:4.0f}"
+            elif plot_height >= 4 and i == plot_height // 2:
+                lbl = f"{vmid:4.0f}"
+            else:
+                lbl = ""
+            axis = f"{lbl:>{axis_w}}"
+
+            try:
+                if color:
+                    stdscr.addnstr(r, 0, " " * (label_w + 1), max_x, color)
+                    stdscr.addnstr(r, label_w + 1, axis[:axis_w], axis_w, color)
+                    stdscr.addnstr(r, start_plot_col, bl[:plot_w],
+                                   max_x - start_plot_col, color)
+                else:
+                    stdscr.addnstr(r, 0, " " * (label_w + 1), max_x)
+                    stdscr.addnstr(r, label_w + 1, axis[:axis_w], axis_w)
+                    stdscr.addnstr(r, start_plot_col, bl[:plot_w],
+                                   max_x - start_plot_col)
+            except curses.error:
+                pass
+
+        row += h
+
+    # Bottom time axis
+    axis_row = max_y - 1
+    if axis_row > 1 and effective_interval_s > 0:
+        try:
+            stdscr.move(axis_row, 0)
+            stdscr.clrtoeol()
+        except curses.error:
+            stdscr.refresh()
+            return plot_w
+
+        num_ticks = 4
+        for t in range(num_ticks + 1):
+            x_rel = int((plot_w - 1) * (1 - t / num_ticks))
+            delta_cols = (plot_w - 1) - x_rel
+            secs_ago = delta_cols * 2 * effective_interval_s  # 2 samples/col
+            mins_ago = int(round(secs_ago / 60.0))
+            label = "now" if mins_ago <= 0 else f"-{mins_ago}m"
+
+            col = start_plot_col + x_rel
+            if col < max_x:
+                trimmed = label[: max_x - col]
+                if trimmed:
+                    try:
+                        stdscr.addnstr(axis_row, col, trimmed, max_x - col)
+                    except curses.error:
+                        pass
+
+    stdscr.refresh()
+    return plot_w
+
+
+# ----- Background worker ---------------------------------------------
+
+
+def powermetrics_worker(
+    stop_event: threading.Event,
+    sample_interval_state: Dict[str, float],
+    out_queue: "queue.Queue[Tuple[str, object]]",
+) -> None:
+    """
+    Background producer:
+      - Reads desired interval from sample_interval_state["desired"].
+      - Runs powermetrics with that interval.
+      - Pushes ("ok", (output, interval_used)) or ("err", message).
+    Daemonized; will be killed automatically when main exits.
+    """
+    while not stop_event.is_set():
+        interval_s = sample_interval_state.get("desired", MIN_SAMPLE_INTERVAL_SECONDS)
+        # Clamp for safety
+        if interval_s < MIN_SAMPLE_INTERVAL_SECONDS:
+            interval_s = MIN_SAMPLE_INTERVAL_SECONDS
+        if interval_s > MAX_SAMPLE_INTERVAL_SECONDS:
+            interval_s = MAX_SAMPLE_INTERVAL_SECONDS
+
+        try:
+            out = run_powermetrics_once(interval_s)
+            out_queue.put(("ok", (out, interval_s)))
+        except subprocess.CalledProcessError as e:
+            if stop_event.is_set():
+                break
+            msg = e.output.strip() or str(e)
+            out_queue.put(("err", msg))
+            time.sleep(0.2)
+        except Exception as e:
+            if stop_event.is_set():
+                break
+            out_queue.put(("err", f"{e}"))
+            time.sleep(0.2)
+
+
+# ----- Main TUI loop -------------------------------------------------
+
+
+def tui(stdscr) -> None:
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+
+    metrics = init_metrics()
+    use_fixed_scale = True
+    paused = False
+    last_error: Optional[str] = None
+
+    # Shared state for worker
+    sample_interval_state = {
+        "desired": MIN_SAMPLE_INTERVAL_SECONDS,
+        "last_used": MIN_SAMPLE_INTERVAL_SECONDS,
+    }
+    data_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+    stop_event = threading.Event()
+
+    # Start background powermetrics thread (daemon)
+    worker = threading.Thread(
+        target=powermetrics_worker,
+        args=(stop_event, sample_interval_state, data_queue),
+        daemon=True,
+    )
+    worker.start()
+
+    # Initial draw
+    last_plot_width = draw(
+        stdscr,
+        metrics,
+        use_fixed_scale,
+        paused,
+        last_error,
+        sample_interval_state["last_used"],
+    )
+
+    while True:
+        # Handle keys frequently -> instant 'q'
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+
+        if ch in (ord("q"), ord("Q")):
+            stop_event.set()
+            break
+        elif ch in (ord("p"), ord("P")):
+            paused = not paused
+        elif ch in (ord("s"), ord("S")):
+            use_fixed_scale = not use_fixed_scale
+
+        # Recompute desired interval based on current width
+        desired = compute_sample_interval_seconds(last_plot_width)
+        sample_interval_state["desired"] = desired
+
+        # Consume any new data from worker
+        try:
+            while True:
+                kind, payload = data_queue.get_nowait()
+                if kind == "ok":
+                    out, used_interval = payload  # type: ignore[misc]
+                    if not paused:
+                        cpu_die, gpu_die, fans = parse_sample(out)
+                        update_metrics(metrics, cpu_die, gpu_die, fans)
+                    sample_interval_state["last_used"] = used_interval
+                    last_error = None
+                elif kind == "err":
+                    last_error = str(payload)
+        except queue.Empty:
+            pass
+
+        # Draw using last_used interval (for correct time axis)
+        eff_interval = sample_interval_state["last_used"]
+        last_plot_width = draw(
+            stdscr,
+            metrics,
+            use_fixed_scale,
+            paused,
+            last_error,
+            eff_interval,
+        )
+
+        # Tiny sleep to avoid busy loop; doesn't affect responsiveness
+        time.sleep(0.05)
+
+
+def main() -> None:
+    if sys.platform != "darwin":
+        print("This tool is for macOS only.", file=sys.stderr)
+        sys.exit(1)
+
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("Please run as root (sudo) so powermetrics can read SMC sensors.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    curses.wrapper(tui)
+
+
+if __name__ == "__main__":
+    main()
